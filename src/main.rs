@@ -62,7 +62,7 @@ async fn main() {
 
     let config = config.unwrap();
 
-    let server_url = Url::parse("wss://laundry.ucsc.gay/iDQ0AdwiAq2Qh6BeiYJP").expect("Invalid WebSocket URL");
+    let server_url = Url::parse("ws://private").expect("Invalid WebSocket URL");
     
     loop {
         //println!("Attempting to connect to the server...");
@@ -162,7 +162,10 @@ async fn handle_connection(ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>
 async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<ServerMessage>) {
     match server_message.action.as_str() {
         "START_MACHINE" => {
-            if let Some(machine_label) = server_message.payload["machine"].as_str() {
+            if let (Some(machine_label), Some(request_id)) = (
+                server_message.payload["machine"].as_str(),
+                server_message.payload["request_id"].as_str()
+            ) {
                 match timeout(Duration::from_secs(5), find_machine_ip(machine_label)).await {
                     Ok(Some(machine_ip)) => {
                         let url = format!("http://{}:8080/action/putInStartMode", machine_ip);
@@ -180,21 +183,27 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                                         ServerMessage {
                                             action: "START_MACHINE_RESPONSE".to_string(),
                                             payload: serde_json::json!({
-                                                "status": "success",
-                                                "data": payload
+                                                "data": payload,
+                                                "request_id": request_id
                                             }),
                                         }
                                     }
                                     Ok(Err(e)) => {
                                         ServerMessage {
                                             action: "START_MACHINE_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "status": "error", "message": format!("Failed to read response: {}", e) }),
+                                            payload: serde_json::json!({
+                                                "error": format!("Failed to read response: {}", e),
+                                                "request_id": request_id 
+                                            }),
                                         }
                                     }
                                     Err(_) => {
                                         ServerMessage {
                                             action: "START_MACHINE_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "status": "error", "message": "Timeout while reading response" }),
+                                            payload: serde_json::json!({
+                                                "error": "Timeout while reading response",
+                                                "request_id": request_id 
+                                            }),
                                         }
                                     }
                                 }
@@ -202,13 +211,19 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                             Ok(Err(e)) => {
                                 ServerMessage {
                                     action: "START_MACHINE_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "status": "error", "message": format!("Failed to send GET request to {}: {}", machine_ip, e) }),
+                                    payload: serde_json::json!({
+                                        "error": format!("Failed to send GET request to {}: {}", machine_ip, e),
+                                        "request_id": request_id 
+                                    }),
                                 }
                             }
                             Err(_) => {
                                 ServerMessage {
                                     action: "START_MACHINE_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "status": "error", "message": "Request timed out after 5 seconds" }),
+                                    payload: serde_json::json!({ 
+                                        "error": "Request timed out after 5 seconds",
+                                        "request_id": request_id
+                                    }),
                                 }
                             }
                         };
@@ -218,14 +233,20 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                     Ok(None) => {
                         let response_message = ServerMessage {
                             action: "START_MACHINE_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "status": "error", "message": format!("Machine {} not found", machine_label) }),
+                            payload: serde_json::json!({
+                                "error": format!("Machine {} not found", machine_label),
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
                     Err(_) => {
                         let response_message = ServerMessage {
                             action: "START_MACHINE_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "status": "error", "message": "Timeout while finding machine IP" }),
+                            payload: serde_json::json!({
+                                "error": "Timeout while finding machine IP",
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
@@ -233,53 +254,73 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
             }
         }
         "GET_MACHINES" => {
-            let machines_url = "http://10.43.0.1:8080/machines";
-            let response_message = match timeout(Duration::from_secs(5), reqwest::get(machines_url)).await {
-                Ok(Ok(response)) => {
-                    match timeout(Duration::from_secs(5), response.text()).await {
-                        Ok(Ok(machines_data)) => {
-                            let payload = match serde_json::from_str::<serde_json::Value>(&machines_data) {
-                                Ok(json_data) => json_data,
-                                Err(_) => serde_json::json!({ "data": machines_data }),
-                            };
+            if let Some(request_id) = server_message.payload["request_id"].as_str() {
+                let machines_url = "http://10.43.0.1:8080/machines";
+                let response_message = match timeout(Duration::from_secs(5), reqwest::get(machines_url)).await {
+                    Ok(Ok(response)) => {
+                        match timeout(Duration::from_secs(5), response.text()).await {
+                            Ok(Ok(machines_data)) => {
+                                let payload = match serde_json::from_str::<serde_json::Value>(&machines_data) {
+                                    Ok(json_data) => json_data,
+                                    Err(_) => serde_json::json!({ "data": machines_data }),
+                                };
 
-                            ServerMessage {
-                                action: "MACHINES_RESPONSE".to_string(),
-                                payload,
+                                ServerMessage {
+                                    action: "MACHINES_RESPONSE".to_string(),
+                                    payload: serde_json::json!({
+                                        "data": payload,
+                                        "request_id": request_id
+                                    }),
+                                }
                             }
-                        }
-                        Ok(Err(e)) => {
-                            ServerMessage {
-                                action: "MACHINES_RESPONSE".to_string(),
-                                payload: serde_json::json!({ "status": "error", "message": format!("Failed to read machines data: {}", e) }),
+                            Ok(Err(e)) => {
+                                ServerMessage {
+                                    action: "MACHINES_RESPONSE".to_string(),
+                                    payload: serde_json::json!({ 
+                                        "error": format!("Failed to read machines data: {}", e) ,
+                                        "request_id": request_id
+                                    }),
+                                }
                             }
-                        }
-                        Err(_) => {
-                            ServerMessage {
-                                action: "MACHINES_RESPONSE".to_string(),
-                                payload: serde_json::json!({ "status": "error", "message": "Timeout while reading response" }),
+                            Err(_) => {
+                                ServerMessage {
+                                    action: "MACHINES_RESPONSE".to_string(),
+                                    payload: serde_json::json!({ 
+                                        "error": "Timeout while reading response",
+                                        "request_id": request_id 
+                                    }),
+                                }
                             }
                         }
                     }
-                }
-                Ok(Err(e)) => {
-                    ServerMessage {
-                        action: "MACHINES_RESPONSE".to_string(),
-                        payload: serde_json::json!({ "status": "error", "message": format!("Failed to get machines data: {}", e) }),
+                    Ok(Err(e)) => {
+                        ServerMessage {
+                            action: "MACHINES_RESPONSE".to_string(),
+                            payload: serde_json::json!({ 
+                                "error": format!("Failed to get machines data: {}", e),
+                                "request_id": request_id
+                            }),
+                        }
                     }
-                }
-                Err(_) => {
-                    ServerMessage {
-                        action: "MACHINES_RESPONSE".to_string(),
-                        payload: serde_json::json!({ "status": "error", "message": "Request timed out after 5 seconds" }),
+                    Err(_) => {
+                        ServerMessage {
+                            action: "MACHINES_RESPONSE".to_string(),
+                            payload: serde_json::json!({
+                                "error": "Request timed out after 5 seconds",
+                                "request_id": request_id
+                            }),
+                        }
                     }
-                }
-            };
+                };
 
-            let _ = tx.send(response_message).await;
+                let _ = tx.send(response_message).await;
+            }
         }
         "GET_MACHINE_STATUS" => {
-            if let Some(machine_label) = server_message.payload["machine"].as_str() {
+            if let (Some(machine_label), Some(request_id)) = (
+                server_message.payload["machine"].as_str(),
+                server_message.payload["request_id"].as_str()
+            ) {
                 match timeout(Duration::from_secs(5), find_machine_ip(machine_label)).await {
                     Ok(Some(machine_ip)) => {
                         let url = format!("http://{}:8080/raw/status", machine_ip);
@@ -296,19 +337,28 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
 
                                         ServerMessage {
                                             action: "MACHINE_STATUS_RESPONSE".to_string(),
-                                            payload,
+                                            payload: serde_json::json!({
+                                                "data": payload,
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                     Ok(Err(e)) => {
                                         ServerMessage {
                                             action: "MACHINE_STATUS_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "error": format!("Failed to read response: {}", e) }),
+                                            payload: serde_json::json!({ 
+                                                "error": format!("Failed to read response: {}", e),
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                     Err(_) => {
                                         ServerMessage {
                                             action: "MACHINE_STATUS_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "error": "Timeout while reading response" }),
+                                            payload: serde_json::json!({ 
+                                                "error": "Timeout while reading response",
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                 }
@@ -316,13 +366,19 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                             Ok(Err(e)) => {
                                 ServerMessage {
                                     action: "MACHINE_STATUS_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "error": format!("Failed to send GET request to {}: {}", machine_ip, e) }),
+                                    payload: serde_json::json!({ 
+                                        "error": format!("Failed to send GET request to {}: {}", machine_ip, e),
+                                        "request_id": request_id
+                                    }),
                                 }
                             }
                             Err(_) => {
                                 ServerMessage {
                                     action: "MACHINE_STATUS_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "error": "Request timed out after 5 seconds" }),
+                                    payload: serde_json::json!({ 
+                                        "error": "Request timed out after 5 seconds",
+                                        "request_id": request_id
+                                    }),
                                 }
                             }
                         };
@@ -332,14 +388,20 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                     Ok(None) => {
                         let response_message = ServerMessage {
                             action: "MACHINE_STATUS_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "error": format!("Machine {} not found", machine_label) }),
+                            payload: serde_json::json!({ 
+                                "error": format!("Machine {} not found", machine_label),
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
                     Err(_) => {
                         let response_message = ServerMessage {
                             action: "MACHINE_STATUS_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "error": "Timeout while finding machine IP" }),
+                            payload: serde_json::json!({ 
+                                "error": "Timeout while finding machine IP",
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
@@ -347,7 +409,10 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
             }
         }
         "GET_MACHINE_HEALTH" => {
-            if let Some(machine_label) = server_message.payload["machine"].as_str() {
+            if let (Some(machine_label), Some(request_id)) = (
+                server_message.payload["machine"].as_str(),
+                server_message.payload["request_id"].as_str()
+            ) {
                 match timeout(Duration::from_secs(5), find_machine_ip(machine_label)).await {
                     Ok(Some(machine_ip)) => {
                         let url = format!("http://{}:8080/health", machine_ip);
@@ -364,19 +429,28 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
 
                                         ServerMessage {
                                             action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                                            payload,
+                                            payload: serde_json::json!({
+                                                "data": payload,
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                     Ok(Err(e)) => {
                                         ServerMessage {
                                             action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "error": format!("Failed to read response: {}", e) }),
+                                            payload: serde_json::json!({ 
+                                                "error": format!("Failed to read response: {}", e),
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                     Err(_) => {
                                         ServerMessage {
                                             action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                                            payload: serde_json::json!({ "error": "Timeout while reading response" }),
+                                            payload: serde_json::json!({ 
+                                                "error": "Timeout while reading response",
+                                                "request_id": request_id
+                                            }),
                                         }
                                     }
                                 }
@@ -384,13 +458,19 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                             Ok(Err(e)) => {
                                 ServerMessage {
                                     action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "error": format!("Failed to send GET request to {}: {}", machine_ip, e) }),
+                                    payload: serde_json::json!({ 
+                                        "error": format!("Failed to send GET request to {}: {}", machine_ip, e),
+                                        "request_id": request_id
+                                    }),
                                 }
                             }
                             Err(_) => {
                                 ServerMessage {
                                     action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                                    payload: serde_json::json!({ "error": "Request timed out after 5 seconds" }),
+                                    payload: serde_json::json!({ 
+                                        "error": "Request timed out after 5 seconds",
+                                        "request_id": request_id
+                                    }),
                                 }
                             }
                         };
@@ -400,18 +480,106 @@ async fn handle_server_message(server_message: ServerMessage, tx: mpsc::Sender<S
                     Ok(None) => {
                         let response_message = ServerMessage {
                             action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "error": format!("Machine {} not found", machine_label) }),
+                            payload: serde_json::json!({ 
+                                "error": format!("Machine {} not found", machine_label),
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
                     Err(_) => {
                         let response_message = ServerMessage {
                             action: "MACHINE_HEALTH_RESPONSE".to_string(),
-                            payload: serde_json::json!({ "error": "Timeout while finding machine IP" }),
+                            payload: serde_json::json!({ 
+                                "error": "Timeout while finding machine IP",
+                                "request_id": request_id
+                            }),
                         };
                         let _ = tx.send(response_message).await;
                     }
                 }
+            }
+        }
+        "GET_STATUS" => {
+            if let Some(request_id) = server_message.payload["request_id"].as_str() {
+                let status_url = "http://10.43.0.1:8080/local/status";
+                let response_message = match timeout(Duration::from_secs(5), reqwest::get(status_url)).await {
+                    Ok(Ok(response)) => {
+                        match timeout(Duration::from_secs(5), response.text()).await {
+                            Ok(Ok(status_data)) => {
+                                let payload = match serde_json::from_str::<serde_json::Value>(&status_data) {
+                                    Ok(json_data) => json_data,
+                                    Err(_) => serde_json::json!({ "data": status_data }),
+                                };
+
+                                ServerMessage {
+                                    action: "STATUS_RESPONSE".to_string(),
+                                    payload: serde_json::json!({
+                                        "data": payload,
+                                        "request_id": request_id
+                                    }),
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                ServerMessage {
+                                    action: "STATUS_RESPONSE".to_string(),
+                                    payload: serde_json::json!({ 
+                                        "error": format!("Failed to read status data: {}", e) ,
+                                        "request_id": request_id
+                                    }),
+                                }
+                            }
+                            Err(_) => {
+                                ServerMessage {
+                                    action: "STATUS_RESPONSE".to_string(),
+                                    payload: serde_json::json!({ 
+                                        "error": "Timeout while reading response",
+                                        "request_id": request_id 
+                                    }),
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        ServerMessage {
+                            action: "STATUS_RESPONSE".to_string(),
+                            payload: serde_json::json!({ 
+                                "error": format!("Failed to get status data: {}", e),
+                                "request_id": request_id
+                            }),
+                        }
+                    }
+                    Err(_) => {
+                        ServerMessage {
+                            action: "STATUS_RESPONSE".to_string(),
+                            payload: serde_json::json!({
+                                "error": "Request timed out after 5 seconds",
+                                "request_id": request_id
+                            }),
+                        }
+                    }
+                };
+
+                let _ = tx.send(response_message).await;
+            }
+        }
+        "GET_CLIENT_INFO" => {
+            if let Some(request_id) = server_message.payload["request_id"].as_str() {
+                let hardcoded_response = serde_json::json!({
+                    "name": "Laundryclient",
+                    "version": "2.0.3",
+                    "motd": "I'm going to touch you.",
+                });
+
+                let response_message = ServerMessage {
+                    action: "CLIENT_INFO_RESPONSE".to_string(),
+                    payload: serde_json::json!({
+                        "data": hardcoded_response,
+                        "request_id": request_id
+                    }),
+                };
+
+                let _ = tx.send(response_message).await;
             }
         }
         _ => println!("Unknown action: {}", server_message.action),
